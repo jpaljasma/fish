@@ -1,29 +1,24 @@
-# AGENTS.md — FishHash POC (Iron Fish GPU mining, RTX 4090)
+# FishHash miner
 
-## Build (from omp bash)
+## Build and test
 
-One-time per session:
+From omp bash at the repo root:
 
-    export COMSPEC='C:\Windows\System32\cmd.exe' MSYS_NO_PATHCONV=1
+```bash
+export COMSPEC='C:\Windows\System32\cmd.exe' MSYS_NO_PATHCONV=1
+cmd /c "tools\build.bat"
+./build/test_gpu_match.exe tests/vectors/vectors.json --dataset-cache build/fishhash-dataset.bin
+```
 
-Then, from the project root:
+The build runs the CPU tests. The GPU test creates the 4.5 GiB dataset if the cache is missing; reuse a valid cache if available. Regenerate fixtures with `build/vecgen.exe <output.json>`; don't hand-edit them. Use Python `blake3` to isolate BLAKE3 discrepancies.
 
-    cmd /c "tools\build.bat"
+## Protocol
 
-`tools/build.bat` locates the x64 compiler with `vswhere`, uses `CUDA_PATH`, and runs
-configure, build, then the CPU oracle. PATH changes stay in the child process.
+- Follow [the protocol reference](docs/protocol.md) and the node oracle. The FishHash nonce is the last eight bytes of the 180-byte header, unlike the legacy layout.
 
-## Tests
+## Throughput
 
-- `ctest` (in build.bat): `test_fishhash` — CPU port vs `tests/vectors/vectors.json`.
-- GPU: `build\test_gpu_match.exe tests\vectors\vectors.json --dataset-cache .scratch\dataset.bin`.
-- Vectors: regenerate with `build\vecgen.exe` (~1.5 s) after header changes; never hand-edit.
-- Python `blake3` (pip) is byte-identical to official BLAKE3 vectors — use to isolate BLAKE3 bugs.
+- Compare `fishbench` runs with the same full dataset and batch size. For live measurements, poll `nvidia-smi -l 1` during mining and report wall-clock MH/s and node-accepted submissions.
+- For sustained tests, use an isolated chain with `miningForce` and FishHash active at height 2. Set genesis difficulty to 65 billion; activation divides it by 100. Fresh devnet spends much of its time submitting blocks and waiting for templates.
 
-## Notes
-
-- RTX 4090 = sm_89. The GPU oracle command builds and saves the 4.5 GiB dataset on first run.
-- `docs/protocol.md` — FishHash and node RPC. The FishHash nonce is the **last** 8 bytes
-  of the 180-byte header, not the first 8 used by the legacy BLAKE3 serializer.
-- `plans/2026-11-17-1519-feat-fishhash-cuda-miner-poc-plan.md` — correctness gates before tuning.
-- `.scratch/` — disposable: probes, reference repos, logs, dataset cache. Not built.
+Keep probes, logs and local cache files in ignored `.scratch/` or `build/`.
