@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <cstring>
 
+#include "../gpu_context.h"
 #include "keccak_device.cuh"  // device rol, round_constants, keccakf1600
 
 namespace fishhash {
@@ -188,136 +189,110 @@ __global__ void fishHashBuildDatasetKernel(const uint32_t* __restrict__ lc,
   }
 }
 
-// ── Shared hash body: header -> 32-B FishHash ──────────────────────────────
-// ds: dataset [kDatasetItems x 32 u32];
-// out: 8 u32 words (32-B hash).
-__device__ __forceinline__ void fishHashHeaderDevice(const uint8_t* header,
-                                                     uint32_t headerLen,
-                                                     const uint32_t* __restrict__ ds,
-                                                     uint32_t* out) {
-  // start value = BLAKE3-512(header)
-  uint32_t seed16[16];
-  blake3SingleChunk(header, headerLen, seed16);
+struct alignas(16) Seed {
+  uint32_t words[16];
+};
+struct CollapsedMix {
+  uint32_t words[8];
+};
+static_assert(sizeof(Seed) == 64 && sizeof(CollapsedMix) == 32);
 
-  uint32_t mix[32];
-  for (int j = 0; j < 16; ++j) {
-    mix[j] = seed16[j];
-    mix[16 + j] = seed16[j];
-  }
-
-  for (uint32_t i = 0; i < kDatasetAccesses; ++i) {
-    const uint32_t p0 = mix[0] % kDatasetItems;
-    const uint32_t p1 = mix[4] % kDatasetItems;
-    const uint32_t p2 = mix[8] % kDatasetItems;
-    const uint4* f0v = reinterpret_cast<const uint4*>(ds + p0 * 32);
-    const uint4* f1v = reinterpret_cast<const uint4*>(ds + p1 * 32);
-    const uint4* f2v = reinterpret_cast<const uint4*>(ds + p2 * 32);
-    uint4* mv = reinterpret_cast<uint4*>(mix);
-#pragma unroll
-    for (int j = 0; j < 8; ++j) {
-      const uint4 a = f0v[j];
-      uint4 b = f1v[j];
-      uint4 c = f2v[j];
-      const uint4 m = mv[j];
-      b.x = fnv1(m.x, b.x);
-      b.y = fnv1(m.y, b.y);
-      b.z = fnv1(m.z, b.z);
-      b.w = fnv1(m.w, b.w);
-      c.x = m.x ^ c.x;
-      c.y = m.y ^ c.y;
-      c.z = m.z ^ c.z;
-      c.w = m.w ^ c.w;
-      // mix.word64s[2j]   = fetch0[2j]   * fetch1[2j]   + fetch2[2j]
-      // mix.word64s[2j+1] = fetch0[2j+1] * fetch1[2j+1] + fetch2[2j+1]
-      // (u64 lanes, little-endian: .x low 32 bits, .y high 32 bits)
-      const uint64_t f0_0 = (static_cast<uint64_t>(a.y) << 32) | a.x;
-      const uint64_t f1_0 = (static_cast<uint64_t>(b.y) << 32) | b.x;
-      const uint64_t f2_0 = (static_cast<uint64_t>(c.y) << 32) | c.x;
-      const uint64_t r0 = f0_0 * f1_0 + f2_0;
-      const uint64_t f0_1 = (static_cast<uint64_t>(a.w) << 32) | a.z;
-      const uint64_t f1_1 = (static_cast<uint64_t>(b.w) << 32) | b.z;
-      const uint64_t f2_1 = (static_cast<uint64_t>(c.w) << 32) | c.z;
-      const uint64_t r1 = f0_1 * f1_1 + f2_1;
-      mv[j].x = static_cast<uint32_t>(r0);
-      mv[j].y = static_cast<uint32_t>(r0 >> 32);
-      mv[j].z = static_cast<uint32_t>(r1);
-      mv[j].w = static_cast<uint32_t>(r1 >> 32);
-    }
-  }
-
-  // Collapse 128 B -> 32 B: FNV chain over each 4-word group.
-  uint32_t collapsed[8];
-#pragma unroll
-  for (int g = 0; g < 8; ++g) {
-    const uint32_t i = g * 4;
-    uint32_t h = fnv1(mix[i], mix[i + 1]);
-    h = fnv1(h, mix[i + 2]);
-    h = fnv1(h, mix[i + 3]);
-    collapsed[g] = h;
-  }
-
-  // Final: BLAKE3-256(startValue[64] || collapsed[32]).
-  uint8_t finalData[96];
-  for (int j = 0; j < 16; ++j) {
-    finalData[j * 4 + 0] = static_cast<uint8_t>(seed16[j] & 0xFF);
-    finalData[j * 4 + 1] = static_cast<uint8_t>((seed16[j] >> 8) & 0xFF);
-    finalData[j * 4 + 2] = static_cast<uint8_t>((seed16[j] >> 16) & 0xFF);
-    finalData[j * 4 + 3] = static_cast<uint8_t>((seed16[j] >> 24) & 0xFF);
-  }
-  for (int j = 0; j < 8; ++j) {
-    finalData[64 + j * 4 + 0] = static_cast<uint8_t>(collapsed[j] & 0xFF);
-    finalData[64 + j * 4 + 1] = static_cast<uint8_t>((collapsed[j] >> 8) & 0xFF);
-    finalData[64 + j * 4 + 2] = static_cast<uint8_t>((collapsed[j] >> 16) & 0xFF);
-    finalData[64 + j * 4 + 3] = static_cast<uint8_t>((collapsed[j] >> 24) & 0xFF);
-  }
-  uint32_t out16[16];
-  blake3SingleChunk(finalData, 96, out16);
-#pragma unroll
-  for (int i = 0; i < 8; ++i) out[i] = out16[i];
+__device__ __forceinline__ uint64_t word64(uint32_t lo, uint32_t hi) {
+  return (uint64_t{hi} << 32) | lo;
 }
 
-// ── Hash kernel: one header per thread ─────────────────────────────────────
-__global__ void fishHashHeaderKernel(const uint8_t* __restrict__ header,
-                                     uint32_t headerLen,
-                                     const uint32_t* __restrict__ ds,
-                                     uint32_t* __restrict__ out) {
-  fishHashHeaderDevice(header, headerLen, ds, out);
+// Eight adjacent lanes own one nonce. Each issues one 16-byte load per
+// dataset item; together they read all 128 bytes. The next round's three
+// addresses come from mix words 0, 4 and 8 (lane 0, 1 and 2's first word).
+__device__ __forceinline__ uint32_t mixLane(const Seed& seed, const uint4* dag) {
+  const unsigned lane = threadIdx.x % 8;
+  const unsigned mask = 0xffu << (threadIdx.x & 24u);
+  uint4 m;
+  memcpy(&m, seed.words + (lane % 4) * 4, sizeof(m));
+#pragma unroll 1
+  for (unsigned r = 0; r < kDatasetAccesses; ++r) {
+    const uint32_t p0 = __shfl_sync(mask, m.x, 0, 8) % kDatasetItems;
+    const uint32_t p1 = __shfl_sync(mask, m.x, 1, 8) % kDatasetItems;
+    const uint32_t p2 = __shfl_sync(mask, m.x, 2, 8) % kDatasetItems;
+    const uint4 a = dag[p0 * 8 + lane];
+    const uint4 b = dag[p1 * 8 + lane];
+    const uint4 c = dag[p2 * 8 + lane];
+    const uint64_t lo = word64(a.x, a.y) * word64(fnv1(m.x, b.x), fnv1(m.y, b.y))
+                      + word64(m.x ^ c.x, m.y ^ c.y);
+    const uint64_t hi = word64(a.z, a.w) * word64(fnv1(m.z, b.z), fnv1(m.w, b.w))
+                      + word64(m.z ^ c.z, m.w ^ c.w);
+    m = make_uint4(uint32_t(lo), uint32_t(lo >> 32), uint32_t(hi), uint32_t(hi >> 32));
+  }
+  return fnv1(fnv1(fnv1(m.x, m.y), m.z), m.w);
 }
 
-// ── Batch hash kernel: nonce sweep over one base header ────────────────────
-struct MiningHeader {
-  uint8_t bytes[180];
+__device__ __forceinline__ void finishHash(const Seed& seed, const CollapsedMix& mix,
+                                          uint32_t digest[16]) {
+  uint32_t cv[8], block[16] = {};
+  memcpy(cv, kBlakeIv, sizeof(cv));
+  memcpy(block, mix.words, sizeof(mix.words));
+  blake3Compress(cv, seed.words, 64, 0, kChunkStart, false, nullptr);
+  blake3Compress(cv, block, 32, 0, kChunkEnd | kRoot, true, digest);
+}
+
+// Arbitrary header length (oracle API); one complete eight-lane group.
+__global__ void fishHashHeaderKernel(const uint8_t* header, uint32_t len,
+                                     const uint4* dag, uint32_t* out) {
+  __shared__ Seed seed;
+  __shared__ CollapsedMix mix;
+  if (threadIdx.x == 0) blake3SingleChunk(header, len, seed.words);
+  __syncwarp(0xff);
+  mix.words[threadIdx.x] = mixLane(seed, dag);
+  __syncwarp(0xff);
+  if (threadIdx.x == 0) {
+    uint32_t digest[16];
+    finishHash(seed, mix, digest);
+    memcpy(out, digest, 32);
+  }
+}
+
+__global__ void seedBatch(MiningJob job, uint64_t first, uint32_t count, Seed* seeds) {
+  const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= count) return;
+  const uint64_t nonce = first + i;
+  uint32_t block[16] = {};
+  memcpy(block, job.tail, sizeof(job.tail));
+  // Nonce bytes 172..179 are big-endian; BLAKE3 reads little-endian words.
+  block[11] = __byte_perm(uint32_t(nonce >> 32), 0, 0x0123);
+  block[12] = __byte_perm(uint32_t(nonce), 0, 0x0123);
+  blake3Compress(job.cv, block, 52, 0, kChunkEnd | kRoot, true, seeds[i].words);
+}
+
+__global__ void mixBatch(const Seed* __restrict__ seeds, const uint4* __restrict__ dag,
+                         uint32_t count, CollapsedMix* __restrict__ mixes) {
+  const uint32_t i = (blockIdx.x * blockDim.x + threadIdx.x) / 8;
+  if (i >= count) return;  // all eight lanes participate or all eight exit
+  mixes[i].words[threadIdx.x % 8] = mixLane(seeds[i], dag);
+}
+
+struct MiningTarget {
+  uint8_t bytes[32];
 };
 
-template<bool search>
-__global__ void fishHashHeaderBatchKernel(MiningHeader header,
-                                          uint64_t nonceStart, uint32_t count,
-                                          const uint32_t* __restrict__ ds,
-                                          uint32_t* __restrict__ out) {
-  const uint32_t t = blockIdx.x * blockDim.x + threadIdx.x;
-  if (t >= count) return;
-  const uint64_t nonce = nonceStart + t;
-#pragma unroll
-  for (int i = 0; i < 8; ++i)
-    header.bytes[179 - i] = static_cast<uint8_t>(nonce >> (8 * i));
-  if constexpr (!search) {
-    fishHashHeaderDevice(header.bytes, sizeof(header.bytes), ds, out + t * 8);
-  } else {
-    uint32_t digest[8];
-    fishHashHeaderDevice(header.bytes, sizeof(header.bytes), ds, digest);
+template<BatchOutput mode>
+__global__ void finishBatch(MiningTarget target, const Seed* seeds, const CollapsedMix* mixes,
+                            uint32_t count, uint32_t* out) {
+  const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= count) return;
+  uint32_t digest[16];
+  finishHash(seeds[i], mixes[i], digest);
+  if constexpr (mode == BatchOutput::FirstHit) {
     const auto* bytes = reinterpret_cast<const uint8_t*>(digest);
-#pragma unroll
-    for (int i = 0; i < 32; ++i) {
-      const uint8_t target = header.bytes[132 + i];
-      if (bytes[i] > target) return;
-      if (bytes[i] < target) break;
+    for (unsigned j = 0; j < sizeof(target.bytes); ++j) {
+      if (bytes[j] > target.bytes[j]) return;
+      if (bytes[j] < target.bytes[j]) break;
     }
-    // Exactly one lane owns the payload, including when multiple hashes qualify.
-    if (atomicCAS(out, UINT32_MAX, t) == UINT32_MAX) {
-#pragma unroll
-      for (int i = 0; i < 8; ++i) out[i + 1] = digest[i];
-    }
+    if (atomicCAS(out, UINT32_MAX, i) != UINT32_MAX) return;
+    ++out;  // only the winning thread owns the eight payload words
+  } else {
+    out += i * 8;
   }
+  memcpy(out, digest, 32);
 }
 
 }  // namespace fishhash
@@ -337,29 +312,30 @@ void launchBuildDataset(const uint32_t* d_lightCache, uint32_t* d_dataset,
 void launchHashHeader(const uint8_t* d_header, uint32_t headerLen,
                       const uint32_t* d_dataset, uint32_t* d_out,
                       cudaStream_t stream) {
-  fishHashHeaderKernel<<<1, 1, 0, stream>>>(d_header, headerLen, d_dataset,
-                                            d_out);
+  fishHashHeaderKernel<<<1, 8, 0, stream>>>(d_header, headerLen,
+                                            reinterpret_cast<const uint4*>(d_dataset), d_out);
 }
 
-void launchHashHeaderBatch(const uint8_t* h_baseHeader, uint64_t nonceStart,
-                           uint32_t count,
-                           const uint32_t* d_dataset, uint32_t* d_out,
-                           cudaStream_t stream) {
-  MiningHeader header;
-  std::memcpy(header.bytes, h_baseHeader, sizeof(header.bytes));
-  constexpr int kThreads = 256;
-  const int blocks = (count + kThreads - 1) / kThreads;
-  fishHashHeaderBatchKernel<false><<<blocks, kThreads, 0, stream>>>(
-      header, nonceStart, count, d_dataset, d_out);
-}
-
-void launchNonceSearch(const uint8_t* base, uint64_t first, uint32_t count,
-                       const uint32_t* dataset, uint32_t* hit, cudaStream_t stream) {
-  MiningHeader header;
-  std::memcpy(header.bytes, base, sizeof(header.bytes));
+cudaError_t launchMiningBatch(const MiningJob& job, uint64_t first, uint32_t count,
+                             const uint32_t* dataset, void* work, uint32_t* out,
+                             BatchOutput mode, cudaStream_t stream) {
+  auto* seeds = static_cast<Seed*>(work);
+  auto* mixes = reinterpret_cast<CollapsedMix*>(seeds + count);
   constexpr int threads = 256;
-  fishHashHeaderBatchKernel<true><<<(count + threads - 1) / threads, threads, 0, stream>>>(
-      header, first, count, dataset, hit);
+  const int blocks = (count + threads - 1) / threads;
+  seedBatch<<<blocks, threads, 0, stream>>>(job, first, count, seeds);
+  if (auto err = cudaGetLastError(); err != cudaSuccess) return err;
+  constexpr int mixThreads = 128, groups = mixThreads / 8;
+  mixBatch<<<(count + groups - 1) / groups, mixThreads, 0, stream>>>(
+      seeds, reinterpret_cast<const uint4*>(dataset), count, mixes);
+  if (auto err = cudaGetLastError(); err != cudaSuccess) return err;
+  MiningTarget target;
+  std::memcpy(target.bytes, job.tail + 1, sizeof(target.bytes));  // header offset 132
+  if (mode == BatchOutput::FirstHit)
+    finishBatch<BatchOutput::FirstHit><<<blocks, threads, 0, stream>>>(target, seeds, mixes, count, out);
+  else
+    finishBatch<BatchOutput::Digests><<<blocks, threads, 0, stream>>>(target, seeds, mixes, count, out);
+  return cudaGetLastError();
 }
 
 }  // namespace fishhash

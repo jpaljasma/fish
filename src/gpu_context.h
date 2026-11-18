@@ -18,6 +18,14 @@
 
 namespace fishhash {
 
+// Immutable input to a nonce sweep. The last eight header bytes are replaced
+// by the candidate nonce; the first two BLAKE3 blocks are compressed once.
+struct MiningJob {
+  explicit MiningJob(const uint8_t header[180]);
+  uint32_t cv[8];
+  uint32_t tail[11];  // header bytes 128..171, including the full target
+};
+
 class GpuContext {
  public:
   // Opens the CUDA device. `deviceIndex < 0` picks the fastest available
@@ -36,12 +44,15 @@ class GpuContext {
         d_header_(o.d_header_),
         d_result_(o.d_result_),
         d_batchOut_(o.d_batchOut_),
+        d_work_(o.d_work_),
+        workCapacity_(o.workCapacity_),
         h_stage_(o.h_stage_),
         h_batchStage_(o.h_batchStage_),
         stream_(o.stream_) {
     o.device_ = -1;
     o.d_light_ = o.d_dataset_ = o.d_header_ = o.d_result_ = nullptr;
-    o.d_batchOut_ = nullptr;
+    o.d_batchOut_ = o.d_work_ = nullptr;
+    o.workCapacity_ = 0;
     o.h_stage_ = o.h_batchStage_ = nullptr;
     o.stream_ = nullptr;
   }
@@ -83,17 +94,20 @@ class GpuContext {
   // Returns a winning offset and fills digest, or UINT32_MAX for no hit.
   // The target is part of the 180-byte FishHash header (bytes 132..163).
   static constexpr uint32_t maxSearchBatch = 1u << 20;
-  uint32_t findNonce(const uint8_t header[180], uint64_t first, uint32_t count,
+  uint32_t findNonce(const MiningJob& job, uint64_t first, uint32_t count,
                      uint8_t digest[32]);
 
  private:
   GpuContext() = default;
+  void reserveMiningWork(uint32_t count);
   int device_ = -1;
   void* d_light_ = nullptr;    // uint32_t [kLightCacheItems * 16]
   void* d_dataset_ = nullptr;  // uint32_t [kDatasetItems * 32]
   void* d_header_ = nullptr;   // scratch, 192 B
   void* d_result_ = nullptr;   // single hash or [winner offset, 8 hash words]
   void* d_batchOut_ = nullptr; // scratch, 65536 * 32 B
+  void* d_work_ = nullptr;     // one 64-byte seed and 32-byte collapsed mix per nonce
+  uint32_t workCapacity_ = 0;
   void* h_stage_ = nullptr;    // pinned staging for a header or hit record
   void* h_batchStage_ = nullptr;  // pinned staging, 65536 * 32 B
   cudaStream_t stream_ = nullptr;
@@ -105,11 +119,9 @@ void launchBuildDataset(const uint32_t* d_lightCache, uint32_t* d_dataset,
 void launchHashHeader(const uint8_t* d_header, uint32_t headerLen,
                       const uint32_t* d_dataset, uint32_t* d_out,
                       cudaStream_t stream);
-void launchHashHeaderBatch(const uint8_t* h_baseHeader, uint64_t nonceStart,
-                           uint32_t count,
-                           const uint32_t* d_dataset, uint32_t* d_out,
-                           cudaStream_t stream);
-void launchNonceSearch(const uint8_t* base, uint64_t first, uint32_t count,
-                       const uint32_t* dataset, uint32_t* hit, cudaStream_t stream);
+enum class BatchOutput { Digests, FirstHit };
+cudaError_t launchMiningBatch(const MiningJob& job, uint64_t first, uint32_t count,
+                             const uint32_t* dataset, void* work, uint32_t* out,
+                             BatchOutput mode, cudaStream_t stream);
 
 }  // namespace fishhash

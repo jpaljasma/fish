@@ -259,11 +259,28 @@ void checkMiningBatch(fishhash::GpuContext& ctx, const fishhash::ItemSource& sou
   CHECK(cpuHits == 1 && cpuWinner == plantedNonce, "CPU finds only the planted nonce");
   CHECK(gpuHits == 1 && gpuWinner == plantedNonce, "batch finds only the planted nonce");
   uint8_t winningHash[32];
-  const auto offset = ctx.findNonce(header, firstNonce, count, winningHash);
+  const fishhash::MiningJob job(header);
+  const auto offset = ctx.findNonce(job, firstNonce, count, winningHash);
   CHECK(offset == plantedNonce - firstNonce &&
         toHex(winningHash, 32) == plantedHash, "GPU search returns the Rust-oracle winner");
-  CHECK(ctx.findNonce(header, firstNonce, count - 1, winningHash) == UINT32_MAX,
+  CHECK(ctx.findNonce(job, firstNonce, count - 1, winningHash) == UINT32_MAX,
         "next search clears the prior hit when the range has no winner");
+
+  // All 513 nonces on the replacement template qualify. Whichever thread
+  // wins the race, its digest must belong to its own offset and template.
+  header[0] ^= 0x80;
+  std::fill(target, target + 32, 0xff);
+  constexpr uint32_t contenders = 513;
+  const auto winner = ctx.findNonce(fishhash::MiningJob(header), firstNonce, contenders, winningHash);
+  CHECK(winner < contenders, "all-ff target returns an in-range winner");
+  if (winner < contenders) {
+    for (unsigned b = 0; b < 8; ++b)
+      header[179 - b] = static_cast<uint8_t>((firstNonce + winner) >> (8 * b));
+    const auto cpu = fishhash::fishHash(source, header, sizeof header);
+    CHECK(std::memcmp(cpu.bytes, winningHash, 32) == 0, "racing winner owns its digest");
+  }
+  CHECK(ctx.findNonce(job, firstNonce, count, winningHash) == plantedNonce - firstNonce &&
+        toHex(winningHash, 32) == plantedHash, "original job still hashes its own template");
 }
 
 }  // namespace

@@ -230,10 +230,11 @@ int main(int argc, char** argv) try {
     std::printf("template seq=%u target=%s\n", st.sequence, toHex(st.target(), 32).c_str());
     std::fflush(stdout);
 
+    const fishhash::MiningJob job(st.header);
     uint64_t nonceBase = 0;
     while (!rpc->hasPendingTemplate()) {
       uint8_t digest[32];
-      const uint32_t winner = ctx.findNonce(st.header, nonceBase, a.batch, digest);
+      const uint32_t winner = ctx.findNonce(job, nonceBase, a.batch, digest);
       totalHashes += a.batch;
       reportHashes += a.batch;
       const auto now = std::chrono::steady_clock::now();

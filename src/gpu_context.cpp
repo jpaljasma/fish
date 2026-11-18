@@ -37,6 +37,16 @@ size_t datasetBytes() { return static_cast<size_t>(kDatasetItems) * 128; }
 
 }  // namespace
 
+MiningJob::MiningJob(const uint8_t header[180]) {
+  blake3_hasher state;
+  blake3_hasher_init(&state);
+  // Feeding 172 bytes compresses two blocks and leaves the last 44 buffered.
+  // The chaining value, unlike a finalized digest, can continue the same chunk.
+  blake3_hasher_update(&state, header, 128 + sizeof(tail));
+  std::memcpy(cv, state.chunk.cv, sizeof(cv));
+  std::memcpy(tail, state.chunk.buf, sizeof(tail));
+}
+
 GpuContext GpuContext::open(int deviceIndex) {
   GpuContext ctx;
   int count = 0;
@@ -78,6 +88,7 @@ GpuContext::~GpuContext() {
   if (d_header_) cudaFree(d_header_);
   if (d_result_) cudaFree(d_result_);
   if (d_batchOut_) cudaFree(d_batchOut_);
+  if (d_work_) cudaFree(d_work_);
   if (h_stage_) cudaFreeHost(h_stage_);
   if (h_batchStage_) cudaFreeHost(h_batchStage_);
   if (stream_) cudaStreamDestroy(stream_);
@@ -180,6 +191,13 @@ std::vector<uint8_t> GpuContext::hashHeader(const uint8_t* header,
   return std::vector<uint8_t>(st, st + 32);
 }
 
+void GpuContext::reserveMiningWork(uint32_t count) {
+  if (count <= workCapacity_) return;
+  if (d_work_) CHECK_CUDA(cudaFree(d_work_));
+  CHECK_CUDA(cudaMalloc(&d_work_, size_t{count} * (64 + 32)));
+  workCapacity_ = count;
+}
+
 std::vector<uint8_t> GpuContext::hashHeaderBatch(const uint8_t* header,
                                                  size_t headerLen,
                                                  uint64_t nonceStart,
@@ -191,10 +209,11 @@ std::vector<uint8_t> GpuContext::hashHeaderBatch(const uint8_t* header,
     CHECK_CUDA(cudaMalloc(&d_batchOut_, kMaxBatch * 32));
     CHECK_CUDA(cudaHostAlloc(&h_batchStage_, kMaxBatch * 32, cudaHostAllocDefault));
   }
-  launchHashHeaderBatch(header, nonceStart, static_cast<uint32_t>(count),
-                        reinterpret_cast<const uint32_t*>(d_dataset_),
-                        reinterpret_cast<uint32_t*>(d_batchOut_), stream_);
-  CHECK_CUDA(cudaGetLastError());
+  const auto n = static_cast<uint32_t>(count);
+  reserveMiningWork(n);
+  CHECK_CUDA(launchMiningBatch(MiningJob(header), nonceStart, n,
+                               static_cast<const uint32_t*>(d_dataset_), d_work_,
+                               static_cast<uint32_t*>(d_batchOut_), BatchOutput::Digests, stream_));
   const size_t bytes = count * 32;
   CHECK_CUDA(cudaMemcpyAsync(h_batchStage_, d_batchOut_, bytes,
                              cudaMemcpyDeviceToHost, stream_));
@@ -203,16 +222,16 @@ std::vector<uint8_t> GpuContext::hashHeaderBatch(const uint8_t* header,
   return std::vector<uint8_t>(st, st + bytes);
 }
 
-uint32_t GpuContext::findNonce(const uint8_t header[180], uint64_t first,
+uint32_t GpuContext::findNonce(const MiningJob& job, uint64_t first,
                                uint32_t count, uint8_t digest[32]) {
   if (!d_dataset_ || !count || count > maxSearchBatch) {
     std::fprintf(stderr, "invalid nonce search: dataset=%p, count=%u\n", d_dataset_, count);
     std::abort();
   }
+  reserveMiningWork(count);
   CHECK_CUDA(cudaMemsetAsync(d_result_, 0xff, 9 * sizeof(uint32_t), stream_));
-  launchNonceSearch(header, first, count, static_cast<const uint32_t*>(d_dataset_),
-                    static_cast<uint32_t*>(d_result_), stream_);
-  CHECK_CUDA(cudaGetLastError());
+  CHECK_CUDA(launchMiningBatch(job, first, count, static_cast<const uint32_t*>(d_dataset_),
+                               d_work_, static_cast<uint32_t*>(d_result_), BatchOutput::FirstHit, stream_));
   CHECK_CUDA(cudaMemcpyAsync(h_stage_, d_result_, 9 * sizeof(uint32_t),
                              cudaMemcpyDeviceToHost, stream_));
   CHECK_CUDA(cudaStreamSynchronize(stream_));
